@@ -3,3 +3,6 @@ __pycache__/
 /assets/*
 demo_data
 /
+
+
+*.mp4
