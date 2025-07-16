@@ -122,11 +122,14 @@ def main(
     with h5py.File(retargeted_poses_path, 'r') as f:
         retargeted_poses = load_dict_from_hdf5(f)
         joint_names = f.attrs['joint_names']
+        link_names = f.attrs['link_names']
         fps = f.attrs['fps']
 
     logger.info(f"Loading SMPL data from: {megahunter_path}")
     with h5py.File(megahunter_path, 'r') as f:
         megahunter_data = load_dict_from_hdf5(f)
+
+    link_pos= retargeted_poses["link_pos"]
 
     rotated_keypoints_path = postprocessed_dir / 'gravity_calibrated_keypoints.h5'
     with h5py.File(rotated_keypoints_path, 'r') as f:
@@ -211,7 +214,7 @@ def main(
         camera.type = mujoco.mjtCamera.mjCAMERA_FREE
         camera.lookat = onp.array([0.0, 0.0, 0.75])
 
-    camera.distance = 4.0
+    camera.distance = 3.0
     camera.elevation = -20.0
     camera.azimuth = 90.0
     frames = []

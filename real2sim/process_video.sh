@@ -154,3 +154,12 @@ python stage4_retargeting/robot_motion_retargeting.py \
     --contact-dir "./demo_data/input_contacts/${VIDEO_NAME}/cam01"
 
 echo "Processing complete!"
+
+
+# Step 5: Convert to ASAP format
+echo "Step 5: Converting to ASAP format..."
+
+python convert_to_asap_format.py \
+    --input_path "./demo_data/output_calib_mesh/megahunter_megasam_reconstruction_results_${VIDEO_NAME}_cam01_frame_${START_FRAME}_${END_FRAME}_subsample_${SUBSAMPLE_FACTOR}/retarget_poses_g1.h5" \
+    --output_path "./demo_data/output_calib_mesh/megahunter_megasam_reconstruction_results_${VIDEO_NAME}_cam01_frame_${START_FRAME}_${END_FRAME}_subsample_${SUBSAMPLE_FACTOR}/${VIDEO_NAME}.pkl" \
+    --name "${VIDEO_NAME}"
