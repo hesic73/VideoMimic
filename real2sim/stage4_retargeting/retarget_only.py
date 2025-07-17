@@ -19,41 +19,6 @@ import pyroki as pk
 import jax_dataclasses as jdc
 from typing import TypedDict
 
-# ===================================================================================
-# 1. UTILITIES & SETUP (Verbatim from original)
-# ===================================================================================
-
-
-def load_dict_from_hdf5(h5file, path="/"):
-    result = {}
-    current_group = h5file[path] if path != "/" else h5file
-    for key in current_group.keys():
-        key_path = f"{path}/{key}" if path != "/" else key
-        if isinstance(h5file[key_path], h5py.Group):
-            result[key] = load_dict_from_hdf5(h5file, key_path)
-        else:
-            result[key] = h5file[key_path][:]
-    for attr_key, attr_value in current_group.attrs.items():
-        result[attr_key] = attr_value
-    return result
-
-
-def save_dict_to_hdf5(h5file, dictionary, path="/"):
-    for key, value in dictionary.items():
-        if value is None:
-            continue
-        full_path = f"{path}/{key}" if path != "/" else key
-        if isinstance(value, dict):
-            group = h5file.create_group(full_path)
-            save_dict_to_hdf5(h5file, value, full_path)
-        elif isinstance(value, onp.ndarray):
-            h5file.create_dataset(full_path, data=value)
-        elif isinstance(value, (int, float, str, bytes, list, tuple)):
-            parent_group = h5file[path] if path != "/" else h5file
-            parent_group.attrs[key] = value
-        else:
-            raise TypeError(f"Unsupported data type: {type(value)} for key {key}")
-
 
 class RetargetingWeights(TypedDict):
     local_pose_cost_weight: float
@@ -119,6 +84,11 @@ smpl_joint_names = [
     "right_ring",
     "right_pinky",
 ]
+
+# Note that we now use _links_ instead of joints.
+# g1_joint_names = (
+#     'pelvis_contour_joint', 'left_hip_pitch_joint', 'left_hip_roll_joint', 'left_hip_yaw_joint', 'left_knee_joint', 'left_ankle_pitch_joint', 'left_ankle_roll_joint', 'left_foot_joint', 'right_hip_pitch_joint', 'right_hip_roll_joint', 'right_hip_yaw_joint', 'right_knee_joint', 'right_ankle_pitch_joint', 'right_ankle_roll_joint', 'right_foot_joint', 'waist_yaw_joint', 'waist_roll_joint', 'waist_pitch_joint', 'logo_joint', 'head_joint', 'waist_support_joint', 'imu_joint', 'd435_joint', 'mid360_joint', 'left_shoulder_pitch_joint', 'left_shoulder_roll_joint', 'left_shoulder_yaw_joint', 'left_elbow_joint', 'left_wrist_roll_joint', 'left_wrist_pitch_joint', 'left_wrist_yaw_joint', 'left_hand_palm_joint', 'right_shoulder_pitch_joint', 'right_shoulder_roll_joint', 'right_shoulder_yaw_joint', 'right_elbow_joint', 'right_wrist_roll_joint', 'right_wrist_pitch_joint', 'right_wrist_yaw_joint', 'right_hand_palm_joint'
+# )
 g1_link_names = (
     "pelvis",
     "pelvis_contour_link",
@@ -163,8 +133,10 @@ g1_link_names = (
     "right_rubber_hand",
 )
 
-smpl_joint_retarget_indices_to_g1, g1_link_retarget_indices = [], []
-key_links = [
+smpl_joint_retarget_indices_to_g1 = []
+g1_link_retarget_indices = []
+
+for smpl_name, g1_name in [
     ("pelvis", "pelvis"),
     ("left_hip", "left_hip_roll_link"),
     ("right_hip", "right_hip_roll_link"),
@@ -180,71 +152,115 @@ key_links = [
     ("right_shoulder", "right_shoulder_roll_link"),
     ("left_foot", "left_foot_link"),
     ("right_foot", "right_foot_link"),
-]
-for smpl_name, g1_name in key_links:
+]:
     smpl_joint_retarget_indices_to_g1.append(smpl_joint_names.index(smpl_name))
     g1_link_retarget_indices.append(g1_link_names.index(g1_name))
-smpl_feet_joint_retarget_indices_to_g1, g1_feet_joint_retarget_indices = [], []
-for smpl_name, g1_name in [
+
+feet_link_pairs_g1 = [
     ("left_foot", "left_foot_link"),
     ("right_foot", "right_foot_link"),
-]:
-    smpl_feet_joint_retarget_indices_to_g1.append(smpl_joint_names.index(smpl_name))
-    g1_feet_joint_retarget_indices.append(g1_link_names.index(g1_name))
-smpl_ankle_joint_retarget_indices_to_g1, g1_ankle_joint_retarget_indices = [], []
-for smpl_name, g1_name in [
+]
+ankle_link_pairs_g1 = [
     ("left_ankle", "left_ankle_pitch_link"),
     ("right_ankle", "right_ankle_pitch_link"),
-]:
+]
+
+smpl_feet_joint_retarget_indices_to_g1 = []
+g1_feet_joint_retarget_indices = []
+
+smpl_ankle_joint_retarget_indices_to_g1 = []
+g1_ankle_joint_retarget_indices = []
+
+for smpl_name, g1_name in feet_link_pairs_g1:
+    smpl_feet_joint_retarget_indices_to_g1.append(smpl_joint_names.index(smpl_name))
+    g1_feet_joint_retarget_indices.append(g1_link_names.index(g1_name))
+
+for smpl_name, g1_name in ankle_link_pairs_g1:
     smpl_ankle_joint_retarget_indices_to_g1.append(smpl_joint_names.index(smpl_name))
     g1_ankle_joint_retarget_indices.append(g1_link_names.index(g1_name))
 
 
-def create_conn_tree(robot: pk.Robot, link_indices: jnp.ndarray) -> jnp.ndarray:
-    n, joint_indices = len(link_indices), [
-        robot.links.parent_joint_indices[link_indices[idx]]
-        for idx in range(len(link_indices))
-    ]
-    conn_matrix = jnp.zeros((n, n))
+def load_dict_from_hdf5(h5file, path="/"):
+    """
+    Recursively load a nested dictionary from an HDF5 file.
 
-    def is_direct_chain(i1, i2):
-        j1, j2 = joint_indices[i1], joint_indices[i2]
-        c = j2
-        while c != -1:
-            p = robot.joints.parent_indices[c]
-            if p == j1:
-                return True
-            if p in joint_indices:
-                break
-            c = p
-        c = j1
-        while c != -1:
-            p = robot.joints.parent_indices[c]
-            if p == j2:
-                return True
-            if p in joint_indices:
-                break
-            c = p
-        return False
+    Args:
+        h5file: An open h5py.File object.
+        path: The current path in the HDF5 file.
 
-    for i in range(n):
-        conn_matrix = conn_matrix.at[i, i].set(1.0)
-        for j in range(i + 1, n):
-            if is_direct_chain(i, j):
-                conn_matrix = conn_matrix.at[i, j].set(1.0).at[j, i].set(1.0)
-    return conn_matrix
+    Returns:
+        A nested dictionary with the data.
+    """
+    result = {}
 
+    # Get the current group
+    if path == "/":
+        current_group = h5file
+    else:
+        current_group = h5file[path]
 
-def sanitize_joint_angles(joint_angles, upper, lower):
-    mod = (joint_angles + jnp.pi) % (2 * jnp.pi) - jnp.pi
-    return jnp.clip(
-        mod, jnp.broadcast_to(lower, mod.shape), jnp.broadcast_to(upper, mod.shape)
-    )
+    # Load datasets and groups
+    for key in current_group.keys():
+        if path == "/":
+            key_path = key
+        else:
+            key_path = f"{path}/{key}"
+
+        if isinstance(h5file[key_path], h5py.Group):
+            result[key] = load_dict_from_hdf5(h5file, key_path)
+        else:
+            result[key] = h5file[key_path][:]
+
+    # Load attributes of the current group
+    for attr_key, attr_value in current_group.attrs.items():
+        result[attr_key] = attr_value
+
+    return result
 
 
-# ===================================================================================
-# 2. CORE OPTIMIZATION (Faithful Reproduction)
-# ===================================================================================
+def save_dict_to_hdf5(h5file, dictionary, path="/"):
+    """
+    Recursively save a nested dictionary to an HDF5 file.
+
+    Args:
+        h5file: An open h5py.File object.
+        dictionary: The nested dictionary to save.
+        path: The current path in the HDF5 file.
+    """
+    for key, value in dictionary.items():
+        if value is None:
+            continue
+        if isinstance(value, dict):
+            # If value is a dictionary, create a group and recurse
+            if path == "/":
+                group_path = key
+            else:
+                group_path = f"{path}/{key}"
+            if group_path not in h5file:
+                group = h5file.create_group(group_path)
+            save_dict_to_hdf5(h5file, value, group_path)
+        elif isinstance(value, onp.ndarray):
+            if path == "/":
+                dataset_path = key
+            else:
+                dataset_path = f"{path}/{key}"
+            h5file.create_dataset(dataset_path, data=value)
+        elif isinstance(value, (int, float, str, bytes, list, tuple)):
+            # Store scalars as attributes of the parent group
+            if path == "/":
+                h5file.attrs[key] = value
+            else:
+                h5file[path].attrs[key] = value
+        else:
+            raise TypeError(f"Unsupported data type: {type(value)} for key {key}")
+
+
+def retract_fn(transform: jaxlie.SE3, delta: jax.Array) -> jaxlie.SE3:
+    """Same as jaxls.SE3Var.retract_fn, but removing updates on certain axes."""
+    delta = delta * jnp.array([1, 1, 1, 0, 0, 0])  # Only update translation.
+    return jaxls.SE3Var.retract_fn(transform, delta)
+
+
 class SmplJointsScaleVarG1(
     jaxls.Var[jax.Array],
     default_factory=lambda: jnp.ones(
@@ -253,146 +269,381 @@ class SmplJointsScaleVarG1(
 ): ...
 
 
-@jaxls.Cost.create_factory
-def local_pose_cost(
-    var_values,
-    var_T_world_root,
-    var_robot_cfg,
-    var_smpl_joints_scale,
-    smpl_mask,
-    robot,
-    keypoints,
-    weight,
+def create_conn_tree(robot: pk.Robot, link_indices: jnp.ndarray) -> jnp.ndarray:
+    """
+    Create a NxN connectivity matrix for N links.
+    The matrix is marked Y if there is a direct kinematic chain connection
+    between the two links, without bypassing the root link.
+    """
+    n = len(link_indices)
+    conn_matrix = jnp.zeros((n, n))
+
+    joint_indices = [
+        robot.links.parent_joint_indices[link_indices[idx]] for idx in range(n)
+    ]
+
+    def is_direct_chain_connection(idx1: int, idx2: int) -> bool:
+        """Check if two joints are connected in the kinematic chain without other retargeted joints between"""
+        joint1 = joint_indices[idx1]
+        joint2 = joint_indices[idx2]
+
+        # Check path from joint2 up to root
+        current = joint2
+        while current != -1:
+            parent = robot.joints.parent_indices[current]
+            if parent == joint1:
+                return True
+            if parent in joint_indices:
+                # Hit another retargeted joint before finding joint1
+                break
+            current = parent
+
+        # Check path from joint1 up to root
+        current = joint1
+        while current != -1:
+            parent = robot.joints.parent_indices[current]
+            if parent == joint2:
+                return True
+            if parent in joint_indices:
+                # Hit another retargeted joint before finding joint2
+                break
+            current = parent
+
+        return False
+
+    # Build symmetric connectivity matrix
+    for i in range(n):
+        conn_matrix = conn_matrix.at[i, i].set(1.0)  # Self-connection
+        for j in range(i + 1, n):
+            if is_direct_chain_connection(i, j):
+                conn_matrix = conn_matrix.at[i, j].set(1.0)
+                conn_matrix = conn_matrix.at[j, i].set(1.0)
+
+    return conn_matrix
+
+
+def sanitize_joint_angles(
+    joint_angles: jnp.ndarray,
+    joint_limits_upper: jnp.ndarray,
+    joint_limits_lower: jnp.ndarray,
 ):
-    robot_cfg, T_world_root = var_values[var_robot_cfg], var_values[var_T_world_root]
-    T_world_link = T_world_root @ jaxlie.SE3(robot.forward_kinematics(cfg=robot_cfg))
-    smpl_pos, robot_pos = (
-        keypoints[jnp.array(smpl_joint_retarget_indices_to_g1)],
-        T_world_link.translation()[jnp.array(g1_link_retarget_indices)],
+    # joint_angles: (T, N)
+    # joint_limits_upper: (N,)
+    # joint_limits_lower: (N,)
+    # return: (T, N)
+    # Reshape to (T,N) if needed
+    if len(joint_angles.shape) == 1:
+        joint_angles = joint_angles.reshape(1, -1)
+
+    # Broadcast limits to match joint angles shape
+    joint_limits_upper = jnp.broadcast_to(joint_limits_upper, joint_angles.shape)
+    joint_limits_lower = jnp.broadcast_to(joint_limits_lower, joint_angles.shape)
+
+    # Assuming the joint angles are in the range of [-pi, pi]
+    # If not, we need to normalize them to be within the range of [-pi, pi]
+    joint_angles_mod = (joint_angles + jnp.pi) % (2 * jnp.pi) - jnp.pi
+
+    # And then clip with the limits
+    joint_angles_clipped = jnp.clip(
+        joint_angles_mod, joint_limits_lower, joint_limits_upper
     )
-    delta_smpl, delta_robot = (
-        smpl_pos[:, None] - smpl_pos[None, :],
-        robot_pos[:, None] - robot_pos[None, :],
-    )
+
+    return joint_angles_clipped
+
+
+@jaxls.Cost.create_factory(name="LocalPoseCost")
+def local_pose_cost(
+    var_values: jaxls.VarValues,
+    var_T_world_root: jaxls.SE3Var,
+    var_robot_cfg: jaxls.Var[jax.Array],
+    var_smpl_joints_scale: SmplJointsScaleVarG1,
+    smpl_mask: jax.Array,
+    robot: pk.Robot,
+    keypoints: jax.Array,  # smpl joints --> keypoints
+    local_pose_cost_weight: jax.Array,
+) -> jax.Array:
+    """Retargeting factor, with a focus on:
+    - matching the relative joint/keypoint positions (vectors).
+    - and matching the relative angles between the vectors.
+    """
+    robot_cfg = var_values[var_robot_cfg]
+    T_root_link = jaxlie.SE3(robot.forward_kinematics(cfg=robot_cfg))
+    T_world_root = var_values[var_T_world_root]
+    T_world_link = T_world_root @ T_root_link
+
+    smpl_joint_retarget_indices = jnp.array(smpl_joint_retarget_indices_to_g1)
+    robot_joint_retarget_indices = jnp.array(g1_link_retarget_indices)
+    smpl_pos = keypoints[jnp.array(smpl_joint_retarget_indices)]
+    robot_pos = T_world_link.translation()[jnp.array(robot_joint_retarget_indices)]
+
+    # T_world_root = var_values[var_T_world_root]
+    # robot_cfg = var_values[var_robot_cfg]
+    # T_root_link = jaxlie.SE3(robot.forward_kinematics(cfg=robot_cfg))
+    # keypoints = T_world_root.inverse() @ keypoints
+
+    # smpl_joint_retarget_indices = jnp.array(smpl_joint_retarget_indices_to_g1)
+    # robot_joint_retarget_indices = jnp.array(g1_link_retarget_indices)
+    # smpl_pos = keypoints[jnp.array(smpl_joint_retarget_indices)]
+    # robot_pos = T_root_link.translation()[jnp.array(robot_joint_retarget_indices)]
+
+    # NxN grid of relative positions.
+    delta_smpl = smpl_pos[:, None] - smpl_pos[None, :]
+    delta_robot = robot_pos[:, None] - robot_pos[None, :]
+
+    # Vector regularization.
     position_scale = var_values[var_smpl_joints_scale][..., None]
-    residual_pos = (
+    residual_position_delta = (
         (delta_smpl - delta_robot * position_scale)
         * (1 - jnp.eye(delta_smpl.shape[0])[..., None])
         * smpl_mask[..., None]
     )
-    delta_smpl_norm, delta_robot_norm = delta_smpl / (
-        jnp.linalg.norm(delta_smpl, axis=-1, keepdims=True) + 1e-6
-    ), delta_robot / (jnp.linalg.norm(delta_robot, axis=-1, keepdims=True) + 1e-6)
-    residual_ang = (
-        (1 - (delta_smpl_norm * delta_robot_norm).sum(axis=-1))
-        * (1 - jnp.eye(delta_smpl.shape[0]))
-        * smpl_mask
+
+    # Vector angle regularization.
+    delta_smpl_normalized = delta_smpl  # / (jnp.linalg.norm(delta_smpl + 1e-6, axis=-1, keepdims=True) + 1e-6)
+    delta_robot_normalized = delta_robot  # / (jnp.linalg.norm(delta_robot + 1e-6, axis=-1, keepdims=True) + 1e-6)
+    residual_angle_delta = 1 - (delta_smpl_normalized * delta_robot_normalized).sum(
+        axis=-1
     )
-    return jnp.concatenate([residual_pos.flatten(), residual_ang.flatten()]) * weight
+
+    # delta_smpl_normalized = delta_smpl / (jnp.linalg.norm(delta_smpl + 1e-6, axis=-1, keepdims=True) + 1e-6)
+    # delta_robot_normalized = delta_robot / (jnp.linalg.norm(delta_robot + 1e-6, axis=-1, keepdims=True) + 1e-6)
+    # residual_angle_delta = jnp.clip(1 - (delta_smpl_normalized * delta_robot_normalized).sum(axis=-1), min=0.1)
+
+    residual_angle_delta = (
+        residual_angle_delta * (1 - jnp.eye(residual_angle_delta.shape[0])) * smpl_mask
+    )
+
+    residual = (
+        jnp.concatenate(
+            [
+                residual_position_delta.flatten(),
+                residual_angle_delta.flatten(),
+            ],
+            axis=0,
+        )
+        * local_pose_cost_weight
+    )
+    return residual
 
 
-@jaxls.Cost.create_factory
+@jaxls.Cost.create_factory(name="GlobalPoseCost")
 def global_pose_cost(
-    var_values,
-    var_T_world_root,
-    var_robot_cfg,
-    var_smpl_joints_scale,
-    smpl_mask,
-    robot,
-    keypoints,
-    weight,
-):
-    robot_cfg, T_world_root = var_values[var_robot_cfg], var_values[var_T_world_root]
-    robot_joints = T_world_root @ jaxlie.SE3(robot.forward_kinematics(cfg=robot_cfg))
-    smpl_pos, robot_pos = (
-        keypoints[jnp.array(smpl_joint_retarget_indices_to_g1)],
-        robot_joints.translation()[jnp.array(g1_link_retarget_indices)],
-    )
-    smpl_center, robot_center = smpl_pos.mean(axis=0, keepdims=True), robot_pos.mean(
+    var_values: jaxls.VarValues,
+    var_T_world_root: jaxls.SE3Var,
+    var_robot_cfg: jaxls.Var[jax.Array],
+    var_smpl_joints_scale: SmplJointsScaleVarG1,
+    smpl_mask: jax.Array,
+    robot: pk.Robot,
+    keypoints: jax.Array,  # smpl joints --> keypoints
+    global_pose_cost_weight: jax.Array,
+) -> jax.Array:
+    robot_cfg = var_values[var_robot_cfg]
+    Ts_root_links = robot.forward_kinematics(cfg=robot_cfg)
+
+    robot_joints = var_values[var_T_world_root] @ jaxlie.SE3(Ts_root_links)
+
+    target_smpl_joint_pos = keypoints[jnp.array(smpl_joint_retarget_indices_to_g1)]
+    target_robot_joint_pos = robot_joints.wxyz_xyz[..., 4:7][
+        jnp.array(g1_link_retarget_indices)
+    ]
+
+    # center to the feetcenter
+    center_between_smpl_feet_joint_pos = target_smpl_joint_pos.mean(
         axis=0, keepdims=True
     )
-    scale = (var_values[var_smpl_joints_scale] * smpl_mask).mean()
-    return (
-        jnp.abs((smpl_pos - smpl_center) * scale - (robot_pos - robot_center)).flatten()
-        * weight
+    center_between_robot_feet_joint_pos = target_robot_joint_pos.mean(
+        axis=0, keepdims=True
+    )
+    recentered_target_smpl_joint_pos = (
+        target_smpl_joint_pos - center_between_smpl_feet_joint_pos
+    )
+    recentered_target_robot_joint_pos = (
+        target_robot_joint_pos - center_between_robot_feet_joint_pos
     )
 
+    global_skeleton_scale = (var_values[var_smpl_joints_scale] * smpl_mask).mean()
 
-@jaxls.Cost.create_factory
+    residual = jnp.abs(
+        recentered_target_smpl_joint_pos * global_skeleton_scale
+        - recentered_target_robot_joint_pos
+    ).flatten()
+    return residual * global_pose_cost_weight
+
+
+@jaxls.Cost.create_factory(name="EndEffectorCost")
 def end_effector_cost(
-    var_values, var_T_world_root, var_robot_cfg, robot, keypoints, weight
-):
-    robot_cfg, T_world_root = var_values[var_robot_cfg], var_values[var_T_world_root]
-    robot_joints = T_world_root @ jaxlie.SE3(robot.forward_kinematics(cfg=robot_cfg))
-    smpl_pos = keypoints[jnp.array(smpl_feet_joint_retarget_indices_to_g1)]
-    robot_pos = robot_joints.translation()[jnp.array(g1_feet_joint_retarget_indices)]
-    return (smpl_pos - robot_pos).flatten() * weight
+    var_values: jaxls.VarValues,
+    var_T_world_root: jaxls.SE3Var,
+    var_robot_cfg: jaxls.Var[jax.Array],
+    robot: pk.Robot,
+    keypoints: jax.Array,  # smpl joints --> keypoints
+    end_effector_cost_weight: jax.Array,
+) -> jax.Array:
+    robot_cfg = var_values[var_robot_cfg]
+    Ts_root_links = robot.forward_kinematics(cfg=robot_cfg)
 
+    robot_joints = var_values[var_T_world_root] @ jaxlie.SE3(Ts_root_links)
 
-@jaxls.Cost.create_factory
-def foot_skating_cost(
-    var_values, var_cfg_t0, var_cfg_t1, robot, contact_left, contact_right, weight
-):
-    fk_t0, fk_t1 = robot.forward_kinematics(
-        cfg=var_values[var_cfg_t0]
-    ), robot.forward_kinematics(cfg=var_values[var_cfg_t1])
-    feet_pos_t0, feet_pos_t1 = (
-        fk_t0[..., 4:7][jnp.array(g1_feet_joint_retarget_indices)],
-        fk_t1[..., 4:7][jnp.array(g1_feet_joint_retarget_indices)],
-    )
-    ankle_pos_t0, ankle_pos_t1 = (
-        fk_t0[..., 4:7][jnp.array(g1_ankle_joint_retarget_indices)],
-        fk_t1[..., 4:7][jnp.array(g1_ankle_joint_retarget_indices)],
-    )
-    residual = (jnp.abs(feet_pos_t1[0] - feet_pos_t0[0]) * contact_left) + (
-        jnp.abs(feet_pos_t1[1] - feet_pos_t0[1]) * contact_right
-    )
-    residual += (jnp.abs(ankle_pos_t1[0] - ankle_pos_t0[0]) * contact_left) + (
-        jnp.abs(ankle_pos_t1[1] - ankle_pos_t0[1]) * contact_right
-    )
-    return residual.flatten() * weight
-
-
-@jaxls.Cost.create_factory
-def ground_contact_cost(
-    var_values, var_T_world_root, var_robot_cfg, robot, target_z, contact_mask, weight
-):
-    T_world_links = var_values[var_T_world_root] @ jaxlie.SE3(
-        robot.forward_kinematics(cfg=var_values[var_robot_cfg])
-    )
-    robot_z = T_world_links.translation()[jnp.array(g1_feet_joint_retarget_indices)][
-        ..., 2
+    target_smpl_feet_joint_pos = keypoints[
+        jnp.array(smpl_feet_joint_retarget_indices_to_g1)
     ]
-    return ((robot_z - target_z) * contact_mask).flatten() * weight
+    target_robot_feet_joint_pos = robot_joints.wxyz_xyz[..., 4:7][
+        jnp.array(g1_feet_joint_retarget_indices)
+    ]
+
+    feet_residual = jnp.abs(
+        target_smpl_feet_joint_pos - target_robot_feet_joint_pos
+    ).flatten()
+    residual = feet_residual
+
+    return residual * end_effector_cost_weight
 
 
-@jaxls.Cost.create_factory
-def hip_yaw_and_pitch_cost(var_values, var_robot_cfg, yaw_w, pitch_w, roll_w):
-    cfg = var_values[var_robot_cfg]
-    return jnp.concatenate(
-        [
-            cfg[..., [2, 8]] * yaw_w,
-            cfg[..., [0, 6]] * pitch_w,
-            cfg[..., [1, 7]] * roll_w,
-        ]
+@jaxls.Cost.create_factory(name="FootSkatingCost")
+def foot_skating_cost(
+    var_values: jaxls.VarValues,
+    var_robot_cfg_t0: jaxls.Var[jax.Array],
+    var_robot_cfg_t1: jaxls.Var[jax.Array],
+    robot: pk.Robot,
+    contact_left_foot: jax.Array,
+    contact_right_foot: jax.Array,
+    foot_skating_cost_weight: jax.Array,
+) -> jax.Array:
+    robot_cfg_t0 = var_values[var_robot_cfg_t0]
+    robot_cfg_t1 = var_values[var_robot_cfg_t1]
+    Ts_root_links_t0 = robot.forward_kinematics(cfg=robot_cfg_t0)
+    Ts_root_links_t1 = robot.forward_kinematics(cfg=robot_cfg_t1)
+
+    feet_pos_t0 = Ts_root_links_t0[..., 4:7][jnp.array(g1_feet_joint_retarget_indices)]
+    feet_pos_t1 = Ts_root_links_t1[..., 4:7][jnp.array(g1_feet_joint_retarget_indices)]
+    ankle_pos_t0 = Ts_root_links_t0[..., 4:7][
+        jnp.array(g1_ankle_joint_retarget_indices)
+    ]
+    ankle_pos_t1 = Ts_root_links_t1[..., 4:7][
+        jnp.array(g1_ankle_joint_retarget_indices)
+    ]
+
+    left_foot_vel = jnp.abs(feet_pos_t1[0] - feet_pos_t0[0])
+    right_foot_vel = jnp.abs(feet_pos_t1[1] - feet_pos_t0[1])
+
+    residual = (left_foot_vel * contact_left_foot).flatten() + (
+        right_foot_vel * contact_right_foot
     ).flatten()
 
-
-@jaxls.Cost.create_factory
-def root_smoothness(var_values, var_t0, var_t1, weight):
-    return (var_values[var_t0].inverse() @ var_values[var_t1]).log().flatten() * weight
-
-
-@jaxls.Cost.create_factory
-def scale_regularization(var_values, var_scale):
-    s = var_values[var_scale]
-    return jnp.concatenate(
-        [
-            (s - 1.0).flatten(),
-            (s - s.T).flatten() * 100.0,
-            jnp.clip(-s, min=0).flatten() * 100.0,
-        ]
+    left_ankle_vel = jnp.abs(ankle_pos_t1[0] - ankle_pos_t0[0])
+    right_ankle_vel = jnp.abs(ankle_pos_t1[1] - ankle_pos_t0[1])
+    residual = (
+        residual
+        + (left_ankle_vel * contact_left_foot).flatten()
+        + (right_ankle_vel * contact_right_foot).flatten()
     )
+
+    return residual * foot_skating_cost_weight
+
+
+@jaxls.Cost.create_factory(name="GroundContactCost")
+def ground_contact_cost(
+    var_values: jaxls.VarValues,
+    var_T_world_root: jaxls.SE3Var,
+    var_robot_cfg: jaxls.Var[jax.Array],
+    robot: pk.Robot,
+    target_ground_z_for_frame: jax.Array,  # Shape (2,) - precomputed Z for left/right
+    contact_mask_for_frame: jax.Array,  # Shape (2,) - 1 if contact, 0 otherwise
+    ground_contact_cost_weight: jax.Array,
+) -> jax.Array:
+    """
+    Penalizes vertical distance between robot feet/ankles and precomputed ground Z,
+    only when contact is active.
+    """
+
+    robot_cfg = var_values[var_robot_cfg]
+    Ts_root_links = robot.forward_kinematics(cfg=robot_cfg)
+    robot_joints_world = var_values[var_T_world_root] @ jaxlie.SE3(Ts_root_links)
+
+    # Get the indices of the relevant robot joints (feet or ankles)
+    robot_joint_indices = jnp.array(g1_feet_joint_retarget_indices)  # Use feet for G1
+
+    # Extract world positions of the relevant robot joints
+    target_robot_joint_pos = robot_joints_world.wxyz_xyz[..., 4:7][
+        robot_joint_indices
+    ]  # (2, 3)
+
+    # Extract Z coordinates
+    robot_joint_z = target_robot_joint_pos[..., 2]  # (2,)
+
+    # Calculate residual: (robot_z - target_ground_z) * contact_mask
+    # We only penalize if the robot foot is above the target ground Z during contact.
+    # Penalizing being below might push the foot through the visual mesh.
+    # Let's use jnp.maximum(0, robot_joint_z - target_ground_z) to only penalize being above.
+    # residual = jnp.maximum(0, robot_joint_z - target_ground_z_for_frame) * contact_mask_for_frame # Shape (2,)
+
+    # Simpler: penalize absolute difference, masked by contact
+    residual = (
+        robot_joint_z - target_ground_z_for_frame
+    ) * contact_mask_for_frame  # Shape (2,)
+
+    return residual * ground_contact_cost_weight
+
+
+@jaxls.Cost.create_factory(name="ScaleRegCost")
+def scale_regularization(
+    var_values: jaxls.VarValues,
+    var_smpl_joints_scale: SmplJointsScaleVarG1,
+) -> jax.Array:
+    """Regularize the scale of the retargeted joints."""
+    # Close to 1.
+    res_0 = (var_values[var_smpl_joints_scale] - 1.0).flatten() * 1.0
+    # Symmetric.
+    res_1 = (
+        var_values[var_smpl_joints_scale] - var_values[var_smpl_joints_scale].T
+    ).flatten() * 100.0
+    # Non-negative.
+    res_2 = jnp.clip(-var_values[var_smpl_joints_scale], min=0).flatten() * 100.0
+    return jnp.concatenate([res_0, res_1, res_2])
+
+
+@jaxls.Cost.create_factory(name="HipYawCost")
+def hip_yaw_and_pitch_cost(
+    var_values: jaxls.VarValues,
+    var_robot_cfg: jaxls.Var[jax.Array],
+    hip_yaw_cost_weight: jax.Array,
+    hip_pitch_cost_weight: jax.Array,
+    hip_roll_cost_weight: jax.Array,
+) -> jax.Array:
+    """Regularize the hip yaw joints to be close to 0."""
+    left_hip_pitch_joint_idx = 0
+    left_hip_roll_joint_idx = 1
+    left_hip_yaw_joint_idx = 2
+    right_hip_pitch_joint_idx = 6
+    right_hip_roll_joint_idx = 7
+    right_hip_yaw_joint_idx = 8
+
+    cfg = var_values[var_robot_cfg]
+    residual = jnp.concatenate(
+        [
+            cfg[..., [left_hip_yaw_joint_idx]] * hip_yaw_cost_weight,
+            cfg[..., [right_hip_yaw_joint_idx]] * hip_yaw_cost_weight,
+            cfg[..., [left_hip_pitch_joint_idx]] * hip_pitch_cost_weight,
+            cfg[..., [right_hip_pitch_joint_idx]] * hip_pitch_cost_weight,
+            cfg[..., [left_hip_roll_joint_idx]] * hip_roll_cost_weight,
+            cfg[..., [right_hip_roll_joint_idx]] * hip_roll_cost_weight,
+        ],
+        axis=-1,
+    )
+    return residual.flatten()
+
+
+@jaxls.Cost.create_factory(name="RootSmoothnessCost")
+def root_smoothness(
+    var_values: jaxls.VarValues,
+    var_Ts_world_root: jaxls.SE3Var,
+    var_Ts_world_root_prev: jaxls.SE3Var,
+    root_smoothness_cost_weight: jax.Array,
+) -> jax.Array:
+    """Smoothness cost for the robot root pose."""
+    return (
+        var_values[var_Ts_world_root].inverse() @ var_values[var_Ts_world_root_prev]
+    ).log().flatten() * root_smoothness_cost_weight
 
 
 @jdc.jit
@@ -437,7 +688,7 @@ def retarget_human_to_robot(
             var_scale,
             jax.tree.map(lambda x: x[None], smpl_mask),
             jax.tree.map(lambda x: x[None], robot),
-            target_keypoints,
+            jnp.array(target_keypoints),
             weights["local_pose_cost_weight"] * valid_timesteps,
         ),
         global_pose_cost(
@@ -446,14 +697,14 @@ def retarget_human_to_robot(
             var_scale,
             jax.tree.map(lambda x: x[None], smpl_mask),
             jax.tree.map(lambda x: x[None], robot),
-            target_keypoints,
+            jnp.array(target_keypoints),
             weights["global_pose_cost_weight"] * valid_timesteps,
         ),
         end_effector_cost(
             var_Ts,
             var_joints,
             jax.tree.map(lambda x: x[None], robot),
-            target_keypoints,
+            jnp.array(target_keypoints),
             weights["end_effector_cost_weight"] * valid_timesteps,
         ),
         ground_contact_cost(
@@ -501,12 +752,7 @@ def retarget_human_to_robot(
             (2 * weights["smoothness_cost_factor_weight"])
             * (valid_timesteps[1:] * valid_timesteps[:-1]),
         ),
-        hip_yaw_and_pitch_cost(
-            var_joints,
-            weights["hip_yaw_cost_weight"],
-            weights["hip_pitch_cost_weight"],
-            weights["hip_roll_cost_weight"],
-        ),
+        # hip_yaw_and_pitch_cost(var_joints, weights["hip_yaw_cost_weight"], weights["hip_pitch_cost_weight"], weights["hip_roll_cost_weight"]),
         scale_regularization(var_scale),
         world_collision_cost(
             var_Ts,
@@ -541,9 +787,6 @@ def retarget_human_to_robot(
     return solved_vals[var_joints], solved_vals[var_Ts]
 
 
-# ===================================================================================
-# 3. MAIN EXECUTION (Correcting NameError)
-# ===================================================================================
 def run_retargeting_core(
     urdf_path: Path,
     src_dir: Path,
@@ -565,6 +808,7 @@ def run_retargeting_core(
     num_timesteps = unpadded_keypoints.shape[0]
 
     print(f"--- 2. Preparing Data for Person {person_id} ({num_timesteps} frames) ---")
+
     initial_T_world_root = jaxlie.SE3.from_rotation_and_translation(
         jaxlie.SO3.from_matrix(unpadded_root_orient[:, 0, :, :]),
         unpadded_keypoints[:, smpl_root_joint_idx, :],
@@ -576,14 +820,23 @@ def run_retargeting_core(
     contacts = {
         fn: pickle.load(open(contact_dir / f"{fn}.pkl", "rb"))
         for fn in world_env.keys()
+        if (contact_dir / f"{fn}.pkl").exists()
     }
+
     left_foot_contact = onp.array(
-        [contacts[fn][int(person_id)]["left_foot_contact"] for fn in world_env.keys()]
+        [
+            contacts.get(fn, {}).get(int(person_id), {}).get("left_foot_contact", 0.0)
+            for fn in world_env.keys()
+        ]
     )
     right_foot_contact = onp.array(
-        [contacts[fn][int(person_id)]["right_foot_contact"] for fn in world_env.keys()]
+        [
+            contacts.get(fn, {}).get(int(person_id), {}).get("right_foot_contact", 0.0)
+            for fn in world_env.keys()
+        ]
     )
 
+    # Then, pad all temporal data.
     padded_num_timesteps = ((num_timesteps - 1) // 100 + 1) * 100
     valid_timesteps = jnp.pad(
         jnp.ones(num_timesteps),
@@ -594,20 +847,6 @@ def run_retargeting_core(
         unpadded_keypoints,
         ((0, padded_num_timesteps - num_timesteps), (0, 0), (0, 0)),
         "edge",
-    )
-    padded_initial_T_world_root = jaxlie.SE3.from_rotation_and_translation(
-        jaxlie.SO3.from_matrix(
-            jnp.pad(
-                initial_T_world_root.rotation().as_matrix(),
-                ((0, padded_num_timesteps - num_timesteps), (0, 0), (0, 0)),
-                "edge",
-            )
-        ),
-        jnp.pad(
-            initial_T_world_root.translation(),
-            ((0, padded_num_timesteps - num_timesteps), (0, 0)),
-            "edge",
-        ),
     )
     padded_left_contact = jnp.pad(
         jnp.array(left_foot_contact),
@@ -654,17 +893,16 @@ def run_retargeting_core(
             if len(valid_up_hits) > 0:
                 update_indices = missed_indices_down[valid_up_hits]
                 index_tri[update_indices] = index_tri_up[valid_up_hits]
-
-        # BUG FIX: Use the correct variable name defined within this scope.
         fallback_z = onp.min(human_feet_pos[..., 2])
-
         target_ground_z_flat = onp.zeros(num_rays)
         valid_hit_indices = onp.where(index_tri != -1)[0]
         if len(valid_hit_indices) > 0:
             hit_triangle_indices = index_tri[valid_hit_indices]
             valid_mask = hit_triangle_indices < len(background_mesh.triangles)
-            valid_hit_indices = valid_hit_indices[valid_mask]
-            hit_triangle_indices = hit_triangle_indices[valid_mask]
+            valid_hit_indices, hit_triangle_indices = (
+                valid_hit_indices[valid_mask],
+                hit_triangle_indices[valid_mask],
+            )
             projected_triangles_center_z = background_mesh.triangles[
                 hit_triangle_indices
             ].mean(axis=1)[:, 2]
@@ -699,13 +937,14 @@ def run_retargeting_core(
 
     print("--- 3. Starting Full Optimization ---")
     start_time = time.time()
+    # LOGIC FIX: Pass the UNPADDED initial_T_world_root to the solver.
     raw_robot_cfg, optimized_T_world_root = retarget_human_to_robot(
         robot,
         robot_coll,
         heightmap,
         valid_timesteps,
         padded_keypoints,
-        padded_initial_T_world_root,
+        initial_T_world_root,
         smpl_mask,
         padded_left_contact,
         padded_right_contact,
@@ -719,7 +958,6 @@ def run_retargeting_core(
     sanitized_cfg = sanitize_joint_angles(
         raw_robot_cfg, robot.joints.upper_limits, robot.joints.lower_limits
     )
-
     export_data = {
         "joints": onp.array(sanitized_cfg[:num_timesteps]),
         "root_pos": onp.array(optimized_T_world_root.translation()[:num_timesteps]),
