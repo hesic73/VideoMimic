@@ -820,7 +820,7 @@ def retarget_human_to_robot(
         variables=[var_Ts_world_root, var_joints, var_smpl_joints_scale],
     ).analyze()
 
-    solved_values = graph.solve(
+    solved_values, summary = graph.solve(
         initial_vals=jaxls.VarValues.make(
             [
                 var_Ts_world_root.with_value(Ts_world_root_smpl),
@@ -828,6 +828,7 @@ def retarget_human_to_robot(
                 var_smpl_joints_scale.with_value(default_smpl_joints_scale),
             ]
         ),
+        return_summary=True,
     )
 
     # Extract results
@@ -835,7 +836,7 @@ def retarget_human_to_robot(
     optimized_robot_cfg = solved_values[var_joints]
     optimized_scale = solved_values[var_smpl_joints_scale][0]
 
-    return optimized_scale, optimized_robot_cfg, optimized_T_world_root
+    return optimized_scale, optimized_robot_cfg, optimized_T_world_root, summary
 
 
 def sanitize_joint_angles(joint_angles: jnp.ndarray, joint_limits_upper: jnp.ndarray, joint_limits_lower: jnp.ndarray):
@@ -1166,7 +1167,7 @@ def process_retargeting(
             print(f"Starting optimization with {org_num_timesteps} timesteps (padded to {padded_num_timesteps}).")
 
             start_time = time.time()
-            _optimized_scale, _optimized_robot_cfg, _optimized_T_world_root = retarget_human_to_robot(
+            _optimized_scale, _optimized_robot_cfg, _optimized_T_world_root, summary = retarget_human_to_robot(
                 robot,
                 robot_coll,
                 heightmap,
@@ -1183,9 +1184,12 @@ def process_retargeting(
                 _optimized_scale,
                 _optimized_robot_cfg,
                 _optimized_T_world_root,
+                summary,
             ))
             end_time = time.time()
             print(f"Optimization finished in {end_time - start_time:.2f} seconds.")
+            print(summary)
+
 
             optimized_scale, optimized_robot_cfg, optimized_T_world_root = _optimized_scale, _optimized_robot_cfg, _optimized_T_world_root
             optimized_robot_cfg = sanitize_joint_angles(optimized_robot_cfg, robot.joints.upper_limits, robot.joints.lower_limits)
