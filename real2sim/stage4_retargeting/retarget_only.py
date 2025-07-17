@@ -268,6 +268,10 @@ class SmplJointsScaleVarG1(
     ),
 ): ...
 
+smpl_joint_scales_g1 = jnp.ones(
+    (len(smpl_joint_retarget_indices_to_g1), len(smpl_joint_retarget_indices_to_g1))
+)
+
 
 def create_conn_tree(robot: pk.Robot, link_indices: jnp.ndarray) -> jnp.ndarray:
     """
@@ -660,55 +664,53 @@ def retarget_human_to_robot(
     target_ground_z: jax.Array,
     weights: RetargetingWeights,
 ):
-    ts = jnp.arange(target_keypoints.shape[0])
-    var_Ts, var_joints, var_scale = (
-        jaxls.SE3Var(ts),
-        robot.joint_var_cls(ts),
-        SmplJointsScaleVarG1(0),
-    )
-    contact_mask = jnp.stack([left_foot_contact, right_foot_contact]).T
+    num_timesteps = target_keypoints.shape[0]
+    jnp_arange_timesteps = jnp.arange(num_timesteps)
 
-    @jaxls.Cost.create_factory
-    def world_collision_cost(var_values, var_Ts_world_root, var_robot_cfg, coll_weight):
-        coll = robot_coll.at_config(robot, var_values[var_robot_cfg]).transform(
-            var_values[var_Ts_world_root]
-        )
-        dist = pk.collision.collide(coll, heightmap)
-        return (
-            pk.collision.colldist_from_sdf(
-                dist, activation_dist=weights["world_coll_margin"]
-            ).flatten()
-            * coll_weight
-        )
+    # Create variables for each timestep
+    var_Ts_world_root = jaxls.SE3Var(jnp_arange_timesteps)
+    var_joints = robot.joint_var_cls(jnp_arange_timesteps)
+    var_smpl_joints_scale = SmplJointsScaleVarG1(0)
+    default_smpl_joints_scale = smpl_joint_scales_g1
 
-    costs = [
+    costs: list[jaxls.Cost] = []
+
+    costs.extend([
         local_pose_cost(
-            var_Ts,
+            var_Ts_world_root,
             var_joints,
-            var_scale,
+            var_smpl_joints_scale,
             jax.tree.map(lambda x: x[None], smpl_mask),
             jax.tree.map(lambda x: x[None], robot),
             jnp.array(target_keypoints),
             weights["local_pose_cost_weight"] * valid_timesteps,
         ),
-        global_pose_cost(
-            var_Ts,
-            var_joints,
-            var_scale,
-            jax.tree.map(lambda x: x[None], smpl_mask),
-            jax.tree.map(lambda x: x[None], robot),
-            jnp.array(target_keypoints),
-            weights["global_pose_cost_weight"] * valid_timesteps,
-        ),
         end_effector_cost(
-            var_Ts,
+            var_Ts_world_root,
             var_joints,
             jax.tree.map(lambda x: x[None], robot),
             jnp.array(target_keypoints),
             weights["end_effector_cost_weight"] * valid_timesteps,
         ),
+        global_pose_cost(
+            var_Ts_world_root,
+            var_joints,
+            var_smpl_joints_scale,
+            jax.tree.map(lambda x: x[None], smpl_mask),
+            jax.tree.map(lambda x: x[None], robot),
+            jnp.array(target_keypoints),
+            weights["global_pose_cost_weight"] * valid_timesteps,
+        ),
+    ])
+
+    contact_mask = jnp.stack([left_foot_contact, right_foot_contact]).T # Shape (T, 2)
+    target_ground_z = target_ground_z # Shape (T, 2)
+    assert contact_mask.shape == (num_timesteps, 2)
+    assert target_ground_z.shape == (num_timesteps, 2), (target_ground_z.shape, num_timesteps)
+
+    costs.extend([
         ground_contact_cost(
-            var_Ts,
+            var_Ts_world_root,
             var_joints,
             jax.tree.map(lambda x: x[None], robot),
             target_ground_z,
@@ -716,75 +718,114 @@ def retarget_human_to_robot(
             weights["ground_contact_cost_weight"] * valid_timesteps,
         ),
         foot_skating_cost(
-            robot.joint_var_cls(ts[:-1]),
-            robot.joint_var_cls(ts[1:]),
+            robot.joint_var_cls(jnp.arange(1, num_timesteps)),
+            robot.joint_var_cls(jnp.arange(0, num_timesteps-1)),
             jax.tree.map(lambda x: x[None], robot),
             left_foot_contact[1:],
             right_foot_contact[1:],
             weights["foot_skating_cost_weight"] * valid_timesteps[1:],
         ),
+    ])
+
+    costs.append(
+        scale_regularization(
+            var_smpl_joints_scale,
+        )
+    )
+
+    @jaxls.Cost.create_factory(name="WorldCollisionCost")
+    def world_collision_cost(
+        var_values: jaxls.VarValues,
+        var_Ts_world_root: jaxls.SE3Var,
+        var_robot_cfg: jaxls.Var[jnp.ndarray],
+        coll_weight: jax.Array,
+    ) -> jax.Array:
+        """
+        World collision; we intentionally use a low weight --
+        high enough to lift the robot up from the ground, but
+        low enough to not interfere with the retargeting.
+        """
+        Ts_world_root = var_values[var_Ts_world_root]
+        robot_cfg = var_values[var_robot_cfg]
+        coll = robot_coll.at_config(robot, robot_cfg)
+        coll = coll.transform(Ts_world_root)
+
+        dist = pk.collision.collide(coll, heightmap)
+        act = pk.collision.colldist_from_sdf(dist, activation_dist=weights["world_coll_margin"])
+        return act.flatten() * coll_weight
+
+    # Robot sanity costs:
+    # - self-collision
+    # - joint limits
+    # - smoothness
+    # - ...
+    costs.extend([
         pk.costs.self_collision_cost(
             jax.tree.map(lambda x: x[None], robot),
             jax.tree.map(lambda x: x[None], robot_coll),
             var_joints,
             margin=0.1,
-            weight=weights["self_coll_factor_weight"]
-            * weights["padding_norm_factor_weight"]
-            * valid_timesteps,
+            weight=(
+                weights["self_coll_factor_weight"] * weights["padding_norm_factor_weight"]
+            ) * valid_timesteps,
         ),
         pk.costs.limit_cost(
             jax.tree.map(lambda x: x[None], robot),
             var_joints,
-            weight=weights["limit_cost_factor_weight"]
-            * weights["padding_norm_factor_weight"]
-            * valid_timesteps,
+            weight=(
+                weights["limit_cost_factor_weight"] * weights["padding_norm_factor_weight"]
+            ) * valid_timesteps,
         ),
         pk.costs.smoothness_cost(
-            robot.joint_var_cls(ts[:-1]),
-            robot.joint_var_cls(ts[1:]),
-            weight=weights["smoothness_cost_factor_weight"]
-            * weights["padding_norm_factor_weight"]
-            * valid_timesteps[1:],
+            robot.joint_var_cls(jnp.arange(1, num_timesteps)),
+            robot.joint_var_cls(jnp.arange(0, num_timesteps-1)),
+            weight=(
+                weights["smoothness_cost_factor_weight"] * weights["padding_norm_factor_weight"]
+            ) * valid_timesteps[1:],
         ),
+        # hip_yaw_and_pitch_cost(
+        #     var_joints,
+        #     weights["hip_yaw_cost_weight"] * weights["padding_norm_factor_weight"] * valid_timesteps,
+        #     weights["hip_pitch_cost_weight"] * weights["padding_norm_factor_weight"] * valid_timesteps,
+        #     weights["hip_roll_cost_weight"] * weights["padding_norm_factor_weight"] * valid_timesteps,
+        # ),
         root_smoothness(
-            jaxls.SE3Var(ts[:-1]),
-            jaxls.SE3Var(ts[1:]),
-            (2 * weights["smoothness_cost_factor_weight"])
-            * (valid_timesteps[1:] * valid_timesteps[:-1]),
+            jaxls.SE3Var(jnp.arange(1, num_timesteps)),
+            jaxls.SE3Var(jnp.arange(0, num_timesteps-1)),
+            (
+                2 * weights["smoothness_cost_factor_weight"]
+            ) * (valid_timesteps[1:] * valid_timesteps[:-1]),
         ),
-        # hip_yaw_and_pitch_cost(var_joints, weights["hip_yaw_cost_weight"], weights["hip_pitch_cost_weight"], weights["hip_roll_cost_weight"]),
-        scale_regularization(var_scale),
         world_collision_cost(
-            var_Ts,
+            var_Ts_world_root,
             var_joints,
-            weights["world_coll_factor_weight"]
-            * weights["padding_norm_factor_weight"]
-            * valid_timesteps,
-        ),
-    ]
+            weights['world_coll_factor_weight'] * weights["padding_norm_factor_weight"] * valid_timesteps,
+        )
+    ])
 
+    # Build and solve graph
     graph = jaxls.LeastSquaresProblem(
-        costs=costs, variables=[var_Ts, var_joints, var_scale]
+        costs=costs,
+        variables=[var_Ts_world_root, var_joints, var_smpl_joints_scale],
     ).analyze()
-    solved_vals, summary = graph.solve(
+
+    solved_values, summary = graph.solve(
         initial_vals=jaxls.VarValues.make(
             [
-                var_Ts.with_value(Ts_world_root_smpl),
+                var_Ts_world_root.with_value(Ts_world_root_smpl),
                 var_joints,
-                var_scale.with_value(
-                    jnp.ones(
-                        (
-                            len(smpl_joint_retarget_indices_to_g1),
-                            len(smpl_joint_retarget_indices_to_g1),
-                        )
-                    )
-                ),
+                var_smpl_joints_scale.with_value(default_smpl_joints_scale),
             ]
         ),
         return_summary=True,
     )
-    print(summary)
-    return solved_vals[var_joints], solved_vals[var_Ts]
+
+    # Extract results
+    optimized_T_world_root = solved_values[var_Ts_world_root]
+    optimized_robot_cfg = solved_values[var_joints]
+    optimized_scale = solved_values[var_smpl_joints_scale][0]
+
+    return optimized_scale, optimized_robot_cfg, optimized_T_world_root, summary
 
 
 def run_retargeting_core(
@@ -815,26 +856,43 @@ def run_retargeting_core(
     )
 
     megahunter_path = src_dir / "gravity_calibrated_megahunter.h5"
-    with h5py.File(megahunter_path, "r") as f:
-        world_env = load_dict_from_hdf5(f)["our_pred_world_cameras_and_structure"]
-    contacts = {
-        fn: pickle.load(open(contact_dir / f"{fn}.pkl", "rb"))
-        for fn in world_env.keys()
-        if (contact_dir / f"{fn}.pkl").exists()
-    }
+    if osp.exists(contact_dir) and osp.exists(megahunter_path):
+        with h5py.File(megahunter_path, "r") as f:
+            world_env = load_dict_from_hdf5(f)["our_pred_world_cameras_and_structure"]
+        contact_estimation = {}
+        for frame_name in world_env.keys():
+            if osp.exists(osp.join(contact_dir, f'{frame_name}.pkl')):
+                with open(osp.join(contact_dir, f'{frame_name}.pkl'), 'rb') as f:
+                    contact_estimation[frame_name] = pickle.load(f) # Dict[person_id, Dict[left_foot_contact, right_foot_contact, frame_contact_vertices]]
 
-    left_foot_contact = onp.array(
-        [
-            contacts.get(fn, {}).get(int(person_id), {}).get("left_foot_contact", 0.0)
-            for fn in world_env.keys()
-        ]
-    )
-    right_foot_contact = onp.array(
-        [
-            contacts.get(fn, {}).get(int(person_id), {}).get("right_foot_contact", 0.0)
-            for fn in world_env.keys()
-        ]
-    )
+        left_foot_contact_list = []
+        right_foot_contact_list = []
+        try:
+            for frame_name in world_env.keys():
+                if int(person_id) in contact_estimation.get(frame_name, {}):
+                    left_foot_contact_list.append(contact_estimation[frame_name][int(person_id)]["left_foot_contact"])
+                    right_foot_contact_list.append(contact_estimation[frame_name][int(person_id)]["right_foot_contact"])
+            
+            left_foot_contact = jnp.array(left_foot_contact_list)
+            right_foot_contact = jnp.array(right_foot_contact_list)
+
+            if len(left_foot_contact) > num_timesteps:
+                left_foot_contact = left_foot_contact[:num_timesteps]
+                right_foot_contact = right_foot_contact[:num_timesteps]
+            else:
+                left_foot_contact = jnp.pad(left_foot_contact, ((0, num_timesteps - len(left_foot_contact)),), mode="edge")
+                right_foot_contact = jnp.pad(right_foot_contact, ((0, num_timesteps - len(right_foot_contact)),), mode="edge")
+
+            assert left_foot_contact.shape == right_foot_contact.shape == (num_timesteps,)
+            
+        except Exception as e:
+            print(f"\033[93mWarning: No feet contact estimation found for person {person_id}. Set to zeros.\033[0m")
+            left_foot_contact = jnp.zeros((num_timesteps,))
+            right_foot_contact = jnp.zeros((num_timesteps,))
+    else:
+        print(f"[Warning]: No feet contact estimation found for person {person_id}. Set to zeros.")
+        left_foot_contact = jnp.zeros((num_timesteps,))
+        right_foot_contact = jnp.zeros((num_timesteps,))
 
     # Then, pad all temporal data.
     padded_num_timesteps = ((num_timesteps - 1) // 100 + 1) * 100
@@ -849,66 +907,117 @@ def run_retargeting_core(
         "edge",
     )
     padded_left_contact = jnp.pad(
-        jnp.array(left_foot_contact),
-        (0, padded_num_timesteps - len(left_foot_contact)),
+        left_foot_contact,
+        (0, padded_num_timesteps - num_timesteps),
         "edge",
     )
     padded_right_contact = jnp.pad(
-        jnp.array(right_foot_contact),
-        (0, padded_num_timesteps - len(right_foot_contact)),
+        right_foot_contact,
+        (0, padded_num_timesteps - num_timesteps),
         "edge",
     )
 
-    background_mesh = (
-        trimesh.load(src_dir / "background_mesh.obj", force="mesh")
-        if (src_dir / "background_mesh.obj").exists()
-        else None
-    )
+    background_mesh = None
+    bg_mesh_path = src_dir / "background_mesh.obj"
+    if bg_mesh_path.exists():
+        background_mesh = trimesh.load(str(bg_mesh_path), force='mesh')
+        if not isinstance(background_mesh, trimesh.Trimesh) or len(background_mesh.faces) == 0:
+            print(f"\033[93mWarning: Background mesh {bg_mesh_path} could not be loaded or is empty.\033[0m")
+            background_mesh = None
+    else:
+        print(f"\033[93mWarning: Background mesh file not found at {bg_mesh_path}.\033[0m")
+        
     padded_target_ground_z = onp.zeros((padded_num_timesteps, 2))
-    if background_mesh is not None and not background_mesh.is_empty:
-        human_feet_pos = onp.array(
-            padded_keypoints[
-                :,
-                [
-                    smpl_joint_names.index("left_foot"),
-                    smpl_joint_names.index("right_foot"),
-                ],
-                :,
-            ]
-        )
-        ray_origins_flat = (human_feet_pos + onp.array([0, 0, 0.1])).reshape(-1, 3)
+    if background_mesh is not None:
+        print("Precomputing target ground Z using raycasting...")
+        
+        relevant_smpl_indices = smpl_feet_joint_retarget_indices_to_g1
+        print("Using SMPL feet for ground projection.")
+        assert len(relevant_smpl_indices) == 2, "Expected 2 relevant SMPL indices (left/right)"
+
+        human_joint_positions = onp.array(padded_keypoints[:, relevant_smpl_indices, :])  # (T, 2, 3)
+
+        # Prepare ray origins slightly above the joints and flatten
+        ray_origins_flat = (human_joint_positions + onp.array([0, 0, 0.1])).reshape(-1, 3) # (T*2, 3)
         num_rays = ray_origins_flat.shape[0]
-        down_directions = onp.full_like(ray_origins_flat, [0, 0, -1.0])
-        index_tri = background_mesh.ray.intersects_first(
-            ray_origins=ray_origins_flat, ray_directions=down_directions
-        )
+
+        # --- Downward Raycast ---
+        down_directions = onp.full_like(ray_origins_flat, [0, 0, -1.0]) # (T*2, 3)
+        print("Performing downward raycast...")
+        index_tri_down = background_mesh.ray.intersects_first(
+            ray_origins=ray_origins_flat,
+            ray_directions=down_directions
+        ) # Shape: (T*2,) Returns -1 on miss
+
+        # Initialize index_tri with downward results
+        index_tri = index_tri_down.copy()
+
+        # --- Upward Raycast for Misses ---
         missed_indices_down = onp.where(index_tri == -1)[0]
         if len(missed_indices_down) > 0:
+            print(f"Downward raycast missed {len(missed_indices_down)} rays. Performing upward raycast for misses...")
             origins_for_upward = ray_origins_flat[missed_indices_down]
             up_directions = onp.full_like(origins_for_upward, [0, 0, 1.0])
+
             index_tri_up = background_mesh.ray.intersects_first(
-                ray_origins=origins_for_upward, ray_directions=up_directions
-            )
+                ray_origins=origins_for_upward,
+                ray_directions=up_directions
+            ) # Shape: (len(missed_indices_down),)
+
+            # Update index_tri with upward hits
             valid_up_hits = onp.where(index_tri_up != -1)[0]
             if len(valid_up_hits) > 0:
-                update_indices = missed_indices_down[valid_up_hits]
-                index_tri[update_indices] = index_tri_up[valid_up_hits]
-        fallback_z = onp.min(human_feet_pos[..., 2])
+                 print(f"Upward raycast found hits for {len(valid_up_hits)} previously missed rays.")
+                 update_indices = missed_indices_down[valid_up_hits]
+                 index_tri[update_indices] = index_tri_up[valid_up_hits]
+            else:
+                 print("Upward raycast did not find any additional hits.")
+
+        # --- Calculate Triangle Center Z and Handle Final Misses ---
+        final_missed_indices = onp.where(index_tri == -1)[0]
+        if len(final_missed_indices) > 0:
+             print(f"\033[93mWarning: {len(final_missed_indices)} rays missed in both directions.\033[0m")
+
+        # Calculate fallback Z based on minimum *human* joint height for stability
+        fallback_z = onp.min(human_joint_positions[..., 2]) if human_joint_positions.size > 0 else 0.0
+        print(f"Using fallback Z: {fallback_z:.3f} for final missed rays.")
+
         target_ground_z_flat = onp.zeros(num_rays)
         valid_hit_indices = onp.where(index_tri != -1)[0]
+
         if len(valid_hit_indices) > 0:
             hit_triangle_indices = index_tri[valid_hit_indices]
-            valid_mask = hit_triangle_indices < len(background_mesh.triangles)
-            valid_hit_indices, hit_triangle_indices = (
-                valid_hit_indices[valid_mask],
-                hit_triangle_indices[valid_mask],
-            )
-            projected_triangles_center_z = background_mesh.triangles[
-                hit_triangle_indices
-            ].mean(axis=1)[:, 2]
+            # Ensure triangle indices are within bounds
+            valid_triangle_indices = hit_triangle_indices < len(background_mesh.triangles)
+            if not onp.all(valid_triangle_indices):
+                print(f"\033[91mError: Found invalid triangle indices after raycast! Check mesh integrity.\033[0m")
+                 # Handle error appropriately, e.g., use fallback for invalid indices
+                invalid_original_indices = valid_hit_indices[~valid_triangle_indices]
+                index_tri[invalid_original_indices] = -1 # Mark as missed
+                # Recalculate valid hits
+                valid_hit_indices = onp.where(index_tri != -1)[0]
+                hit_triangle_indices = index_tri[valid_hit_indices]
+
+            projected_triangles = background_mesh.triangles[hit_triangle_indices] # (num_valid_hits, 3, 3)
+            projected_triangles_center = projected_triangles.mean(axis=1) # (num_valid_hits, 3)
+            projected_triangles_center_z = projected_triangles_center[:, 2] # (num_valid_hits,)
             target_ground_z_flat[valid_hit_indices] = projected_triangles_center_z
+
+        # Apply fallback Z to all missed indices
         target_ground_z_flat[index_tri == -1] = fallback_z
-        padded_target_ground_z = jnp.array(target_ground_z_flat.reshape(-1, 2))
+
+        # Reshape back to (T, 2)
+        padded_target_ground_z = target_ground_z_flat.reshape(-1, 2) # Reshape to (T, 2)
+
+        print(f"Raycasting complete. Final Misses: {len(final_missed_indices)}")
+
+    else:
+        # If no mesh, fill with zeros (or fallback Z)
+        fallback_z = onp.min(onp.array(padded_keypoints)[..., 2]) if padded_keypoints.size > 0 else 0.0
+        padded_target_ground_z.fill(fallback_z)
+        print("Skipping ground Z precomputation (no mesh).")
+
+    padded_target_ground_z = jnp.array(padded_target_ground_z) # Convert to JAX array
 
     smpl_mask = create_conn_tree(robot, jnp.array(g1_link_retarget_indices))
     heightmap = (
@@ -938,7 +1047,7 @@ def run_retargeting_core(
     print("--- 3. Starting Full Optimization ---")
     start_time = time.time()
     # LOGIC FIX: Pass the UNPADDED initial_T_world_root to the solver.
-    raw_robot_cfg, optimized_T_world_root = retarget_human_to_robot(
+    optimized_scale, raw_robot_cfg, optimized_T_world_root, summary = retarget_human_to_robot(
         robot,
         robot_coll,
         heightmap,
@@ -951,8 +1060,9 @@ def run_retargeting_core(
         padded_target_ground_z,
         weights,
     )
-    jax.block_until_ready((raw_robot_cfg, optimized_T_world_root))
+    jax.block_until_ready((optimized_scale, raw_robot_cfg, optimized_T_world_root, summary))
     print(f"Optimization finished in {time.time() - start_time:.2f}s")
+    print(summary)
 
     print("--- 4. Sanitizing and Saving Results ---")
     sanitized_cfg = sanitize_joint_angles(
