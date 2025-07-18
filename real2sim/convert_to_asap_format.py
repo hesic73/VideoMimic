@@ -128,8 +128,14 @@ def main(
 
     # --- 2. Process root and joint rotations to create pose_aa ---
     # Convert root quaternion (xyzw) to axis-angle
-    root_aa = Rotation.from_quat(root_quat).as_rotvec()
+    root_rot = Rotation.from_quat(root_quat)  # (N,)
+    first_inv = root_rot[0].inv()
+    root_rot_aligned = first_inv * root_rot  # (N,)
+    root_aa = root_rot_aligned.as_rotvec()  # (N, 3)
     root_aa = root_aa[:, np.newaxis, :]  # Reshape to (N, 1, 3)
+
+    # Apply the same rotation to root_trans_offset
+    root_trans_offset = first_inv.apply(root_trans_offset)
 
     # Reorder joints to match ASAP_JOINT_ORDER
     source_joint_names = joint_names  # No decoding needed as per feedback
