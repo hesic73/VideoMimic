@@ -54,6 +54,7 @@ class RetargetingWeights(TypedDict):
     smoothness_cost_factor_weight: float
     foot_skating_cost_weight: float
     ground_contact_cost_weight: float
+    ground_prior_cost_weight: float
     padding_norm_factor_weight: float
     hip_yaw_cost_weight: float
     hip_pitch_cost_weight: float
@@ -574,6 +575,10 @@ def ground_contact_cost(
     """
     Penalizes vertical distance between robot feet/ankles and precomputed ground Z,
     only when contact is active.
+    
+    Fixed implementation that prevents foot penetration through the ground:
+    - When robot foot is above ground: penalize the distance
+    - When robot foot is below ground (penetration): apply extra penalty to prevent clipping
     """
 
     robot_cfg = var_values[var_robot_cfg]
@@ -588,18 +593,60 @@ def ground_contact_cost(
 
     # Extract Z coordinates
     robot_joint_z = target_robot_joint_pos[..., 2] # (2,)
-
-    # Calculate residual: (robot_z - target_ground_z) * contact_mask
-    # We only penalize if the robot foot is above the target ground Z during contact.
-    # Penalizing being below might push the foot through the visual mesh.
-    # Let's use jnp.maximum(0, robot_joint_z - target_ground_z) to only penalize being above.
-    # residual = jnp.maximum(0, robot_joint_z - target_ground_z_for_frame) * contact_mask_for_frame # Shape (2,)
     
-    # Simpler: penalize absolute difference, masked by contact
-    residual = (robot_joint_z - target_ground_z_for_frame) * contact_mask_for_frame # Shape (2,)
-
+    # Calculate the height difference
+    height_diff = robot_joint_z - target_ground_z_for_frame # Shape (2,)
+    
+    # Method 1: Use absolute value to penalize both above and below ground
+    # residual = jnp.abs(height_diff) * contact_mask_for_frame
+    
+    # Method 2: Apply different penalties for above vs below ground
+    # - Above ground (height_diff > 0): normal penalty
+    # - Below ground (height_diff < 0): stronger penalty to prevent penetration
+    above_ground_penalty = jnp.maximum(0, height_diff)  # Only positive values
+    below_ground_penalty = jnp.maximum(0, -height_diff) * 2.0  # Double penalty for penetration
+    residual = (above_ground_penalty + below_ground_penalty) * contact_mask_for_frame
 
     return residual * ground_contact_cost_weight
+
+
+@jaxls.Cost.create_factory(name="GroundPriorCost")
+def ground_prior_cost(
+    var_values: jaxls.VarValues,
+    var_T_world_root: jaxls.SE3Var,
+    var_robot_cfg: jaxls.Var[jax.Array],
+    robot: pk.Robot,
+    target_ground_z_for_frame: jax.Array, # Shape (2,) - precomputed Z for left/right feet
+    ground_prior_mask_for_frame: jax.Array, # Shape () - scalar, 1 if constraint applies, 0 otherwise
+    ground_prior_cost_weight: jax.Array,
+) -> jax.Array:
+    """
+    Prior constraint: assumes terrain is flat and feet are grounded 
+    in the first n and last n frames.
+    
+    Processes single timestep, jaxls handles vectorization.
+    """
+    
+    robot_cfg = var_values[var_robot_cfg]
+    Ts_root_links = robot.forward_kinematics(cfg=robot_cfg)
+    robot_joints_world = var_values[var_T_world_root] @ jaxlie.SE3(Ts_root_links)
+
+    # Get the indices of the relevant robot joints (feet)
+    robot_joint_indices = jnp.array(g1_feet_joint_retarget_indices) # Use feet for G1
+
+    # Extract world positions of the relevant robot joints
+    target_robot_joint_pos = robot_joints_world.wxyz_xyz[..., 4:7][robot_joint_indices] # (2, 3)
+
+    # Extract Z coordinates
+    robot_joint_z = target_robot_joint_pos[..., 2]  # (2,)
+    
+    # Apply constraint: force feet to be close to ground height
+    height_diff = robot_joint_z - target_ground_z_for_frame  # Shape (2,)
+    
+    # Use squared error to strongly enforce the constraint, masked by constraint mask
+    residual = (height_diff ** 2) * ground_prior_mask_for_frame  # Shape (2,)
+    
+    return residual * ground_prior_cost_weight
 
 
 @jaxls.Cost.create_factory(name="ScaleRegCost")
@@ -674,6 +721,7 @@ def retarget_human_to_robot(
     right_foot_contact: jax.Array,
     target_ground_z: jax.Array,
     weights: RetargetingWeights,
+    n_prior_frames: int = 5,
 ):
     num_timesteps = target_keypoints.shape[0]
     jnp_arange_timesteps = jnp.arange(num_timesteps)
@@ -718,6 +766,26 @@ def retarget_human_to_robot(
     target_ground_z = target_ground_z # Shape (T, 2)
     assert contact_mask.shape == (num_timesteps, 2)
     assert target_ground_z.shape == (num_timesteps, 2), (target_ground_z.shape, num_timesteps)
+    
+    # Precompute ground prior mask (first n and last n valid frames)
+    timestep_indices = jnp.arange(num_timesteps)
+    
+    # Find the actual number of valid timesteps (count non-zero valid_timesteps)
+    # We can't use jnp.sum() directly due to JAX compilation, but we can use it to create the mask
+    valid_count = jnp.sum(valid_timesteps)  # This will be constant at compile time since valid_timesteps is known
+    
+    # Create mask for start frames (first n_prior_frames among all timesteps)
+    is_start_frames = (timestep_indices < n_prior_frames) & (valid_timesteps > 0)
+    
+    # Create mask for end frames - we need to be more clever here
+    # Since we can't dynamically compute valid_count, we'll use a different approach:
+    # We'll look at the last n_prior_frames of the entire sequence that have valid_timesteps > 0
+    reversed_valid = valid_timesteps[::-1]  # Reverse the valid timesteps
+    reversed_indices = jnp.arange(num_timesteps)
+    is_end_frames_reversed = (reversed_indices < n_prior_frames) & (reversed_valid > 0)
+    is_end_frames = is_end_frames_reversed[::-1]  # Reverse back
+    
+    ground_prior_mask = (is_start_frames | is_end_frames).astype(jnp.float32)
 
     costs.extend([
         ground_contact_cost(
@@ -737,6 +805,18 @@ def retarget_human_to_robot(
             weights["foot_skating_cost_weight"] * valid_timesteps[1:],
         ),
     ])
+
+    # Add ground prior cost for start and end frames (jaxls auto-vectorized)
+    costs.append(
+        ground_prior_cost(
+            var_Ts_world_root,
+            var_joints,
+            jax.tree.map(lambda x: x[None], robot),
+            target_ground_z,
+            ground_prior_mask,
+            weights["ground_prior_cost_weight"] * valid_timesteps,
+        )
+    )
 
     costs.append(
         scale_regularization(
@@ -868,25 +948,26 @@ def process_retargeting(
     robot_coll: pk.collision.RobotCollision,
     src_dir: Path,
     contact_dir: Path,
-    subsample_factor: int = 1,
-    offset_factor: float = 0.00,
-    smpl_root_joint_idx: int = 0,
-    vis: bool = False,
-    multihuman: bool = False,
-    top_k: int = 1,
-    local_pose_cost_weight: float = 1.0,
-    end_effector_cost_weight: float = 5.0,
-    global_pose_cost_weight: float = 8.0,
-    self_coll_factor_weight: float = 1.0,
-    world_coll_factor_weight: float = 1.0,
-    world_coll_margin: float = 0.01,
-    limit_cost_factor_weight: float = 1000.0,
-    smoothness_cost_factor_weight: float = 2.0,
-    foot_skating_cost_weight: float = 1.0,
-    ground_contact_cost_weight: float = 5.0,
-    hip_yaw_cost_weight: float = 50.0,
-    hip_pitch_cost_weight: float = 50.0,
-    hip_roll_cost_weight: float = 50.0,
+    subsample_factor: int,
+    offset_factor: float,
+    smpl_root_joint_idx: int,
+    vis: bool,
+    multihuman: bool,
+    top_k: int,
+    local_pose_cost_weight: float,
+    end_effector_cost_weight: float,
+    global_pose_cost_weight: float,
+    self_coll_factor_weight: float,
+    world_coll_factor_weight: float,
+    world_coll_margin: float,
+    limit_cost_factor_weight: float,
+    smoothness_cost_factor_weight: float,
+    foot_skating_cost_weight: float,
+    ground_contact_cost_weight: float,
+    ground_prior_cost_weight: float,
+    hip_yaw_cost_weight: float,
+    hip_pitch_cost_weight: float,
+    hip_roll_cost_weight: float,
 ) -> None:
     """ Load source data: human keypoints and background mesh. """
     # Extract the frame indices used; input path contains information about the frames used
@@ -950,6 +1031,7 @@ def process_retargeting(
         "smoothness_cost_factor_weight": smoothness_cost_factor_weight,
         "foot_skating_cost_weight": foot_skating_cost_weight,
         "ground_contact_cost_weight": ground_contact_cost_weight,
+        "ground_prior_cost_weight": ground_prior_cost_weight,
         "padding_norm_factor_weight": 1.0,  # Will be updated per person
         "hip_yaw_cost_weight": hip_yaw_cost_weight,
         "hip_pitch_cost_weight": hip_pitch_cost_weight,
@@ -1179,6 +1261,7 @@ def process_retargeting(
                 right_foot_contact,
                 target_ground_z,
                 weight_tuner.get_weights() if weight_tuner else weights,
+                n_prior_frames=5,
             )
             jax.block_until_ready((
                 _optimized_scale,
@@ -1639,6 +1722,7 @@ def main(
     smoothness_cost_factor_weight: float = 10.0,
     foot_skating_cost_weight: float = 10.0,
     ground_contact_cost_weight: float = 1.0,
+    ground_prior_cost_weight: float = 5.0,
     hip_yaw_cost_weight: float = 5.0,
     hip_pitch_cost_weight: float = 0.0,
     hip_roll_cost_weight: float = 0.0,
@@ -1667,6 +1751,7 @@ def main(
         robot=robot,
         robot_coll=robot_coll,
         offset_factor=offset_factor,
+        smpl_root_joint_idx=0,
         vis=vis,
         multihuman=multihuman,
         top_k=top_k,
@@ -1680,6 +1765,7 @@ def main(
         smoothness_cost_factor_weight=smoothness_cost_factor_weight,
         foot_skating_cost_weight=foot_skating_cost_weight,
         ground_contact_cost_weight=ground_contact_cost_weight,
+        ground_prior_cost_weight=ground_prior_cost_weight,
         hip_yaw_cost_weight=hip_yaw_cost_weight,
         hip_pitch_cost_weight=hip_pitch_cost_weight,
         hip_roll_cost_weight=hip_roll_cost_weight,

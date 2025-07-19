@@ -124,14 +124,16 @@ def main(
 
     # --- 1. Infer initial position from feet height trajectory ---
     # We want to apply a transformation to root so that feet at their lowest point are at z=0.035
-    feet_height_avg = np.mean(feet_link_z, axis=1)  # (N,) - average of left and right foot
     
     # Find the minimum average feet height (lowest point)
-    min_feet_height = np.min(feet_height_avg)
+    min_feet_height = np.min(feet_link_z)
     
     # Calculate the offset needed: we want min_feet_height to become 0.035
     # So the offset is: 0.035 - min_feet_height
-    feet_offset = 0.035 - min_feet_height
+    # feet_offset = 0.035 - min_feet_height
+
+    # NOTE (hsc): 它估计的不准，还是第几帧的平均值吧。先验在于，前面几帧和最后几帧应该是着地的
+    feet_offset = 0.035 - (feet_link_z[0:5].mean()+feet_link_z[-5:].mean())/2
     
     # Set initial position: xy at (0,0), z based on root position plus offset
     initial_pos_np = np.array([0.0, 0.0, root_pos[0, 2] + feet_offset])
