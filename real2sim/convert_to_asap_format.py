@@ -4,9 +4,6 @@ import tyro
 from pathlib import Path
 import joblib
 from scipy.spatial.transform import Rotation
-from typing import Tuple
-
-
 from loguru import logger
 
 ASAP_JOINT_ORDER = [
@@ -104,38 +101,74 @@ def main(
     input_path: Path,
     output_path: Path,
     name: str,
-    initial_pos: Tuple[float, float, float] = (0.0, 0.0, 0.8),
 ):
     with h5py.File(input_path, "r") as f:
         joints = f["joints"][:]  # (N, J)
         root_pos = f["root_pos"][:]  # (N, 3)
         root_quat = f["root_quat"][:]  # (N, 4) in xyzw convention
 
-        # link_pos and link_quat are not needed
-        # link_pos = f["link_pos"][:]
-        # link_quat = f["link_quat"][:]
+        link_pos = f["link_pos"][:]
+        link_quat = f["link_quat"][:]
+        link_names = f.attrs["link_names"].tolist()
 
-        # link_names is not needed
-        # link_names = f.attrs["link_names"]
 
         joint_names = f.attrs["joint_names"]
         fps = f.attrs["fps"]
 
-    # --- 1. Process root translation ---
-    initial_pos_np = np.array(initial_pos)
+
+    feet_link_names = ["left_ankle_pitch_link", "right_ankle_pitch_link"]
+    feet_link_indices = [link_names.index(name) for name in feet_link_names]
+    feet_link_pos = link_pos[:, feet_link_indices,:]
+    feet_link_z = feet_link_pos[..., 2] # (N, 2)
+    print(f"Feet link z positions: {feet_link_z}")
+
+    # --- 1. Infer initial position from feet height trajectory ---
+    # We want to apply a transformation to root so that feet at their lowest point are at z=0.035
+    feet_height_avg = np.mean(feet_link_z, axis=1)  # (N,) - average of left and right foot
+    
+    # Find the minimum average feet height (lowest point)
+    min_feet_height = np.min(feet_height_avg)
+    
+    # Calculate the offset needed: we want min_feet_height to become 0.035
+    # So the offset is: 0.035 - min_feet_height
+    feet_offset = 0.035 - min_feet_height
+    
+    # Set initial position: xy at (0,0), z based on root position plus offset
+    initial_pos_np = np.array([0.0, 0.0, root_pos[0, 2] + feet_offset])
+    
+    print(f"Minimum feet height: {min_feet_height:.4f}")
+    print(f"Feet offset: {feet_offset:.4f}")
+    print(f"Original root z: {root_pos[0, 2]:.4f}")
+    print(f"Inferred initial position: {initial_pos_np}")
+    
     root_pos_offset = initial_pos_np - root_pos[0]
     root_trans_offset = root_pos + root_pos_offset
 
     # --- 2. Process root and joint rotations to create pose_aa ---
     # Convert root quaternion (xyzw) to axis-angle
     root_rot = Rotation.from_quat(root_quat)  # (N,)
-    first_inv = root_rot[0].inv()
-    root_rot_aligned = first_inv * root_rot  # (N,)
+    
+    # Calculate the yaw correction rotation
+    # Get the forward direction from the first root rotation
+    forward_dir = root_rot[0].apply([1, 0, 0])  # Apply rotation to [1,0,0] to get current forward
+    forward_xy = forward_dir[:2]  # Take xy components
+    current_yaw = np.arctan2(forward_xy[1], forward_xy[0])  # Calculate current yaw angle
+    
+    # We want to rotate by negative yaw to align forward direction to x-axis
+    yaw_correction = Rotation.from_euler('z', -current_yaw)
+    
+    # Apply the yaw correction to all rotations
+    root_rot_aligned = yaw_correction * root_rot  # (N,)
     root_aa = root_rot_aligned.as_rotvec()  # (N, 3)
     root_aa = root_aa[:, np.newaxis, :]  # Reshape to (N, 1, 3)
 
     # Apply the same rotation to root_trans_offset
-    root_trans_offset = first_inv.apply(root_trans_offset)
+    root_trans_offset = yaw_correction.apply(root_trans_offset)
+    
+    print(f"Original forward direction: {forward_dir}")
+    print(f"Forward xy components: {forward_xy}")
+    print(f"Current yaw angle: {np.degrees(current_yaw):.2f} degrees")
+    print(f"Yaw correction: {np.degrees(-current_yaw):.2f} degrees")
 
     # Reorder joints to match ASAP_JOINT_ORDER
     source_joint_names = joint_names  # No decoding needed as per feedback
