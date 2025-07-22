@@ -874,12 +874,12 @@ def retarget_human_to_robot(
                 weights["smoothness_cost_factor_weight"] * weights["padding_norm_factor_weight"]
             ) * valid_timesteps[1:],
         ),
-        # hip_yaw_and_pitch_cost(
-        #     var_joints,
-        #     weights["hip_yaw_cost_weight"] * weights["padding_norm_factor_weight"] * valid_timesteps,
-        #     weights["hip_pitch_cost_weight"] * weights["padding_norm_factor_weight"] * valid_timesteps,
-        #     weights["hip_roll_cost_weight"] * weights["padding_norm_factor_weight"] * valid_timesteps,
-        # ),
+        hip_yaw_and_pitch_cost(
+            var_joints,
+            weights["hip_yaw_cost_weight"] * weights["padding_norm_factor_weight"] * valid_timesteps,
+            weights["hip_pitch_cost_weight"] * weights["padding_norm_factor_weight"] * valid_timesteps,
+            weights["hip_roll_cost_weight"] * weights["padding_norm_factor_weight"] * valid_timesteps,
+        ),
         root_smoothness(
             jaxls.SE3Var(jnp.arange(1, num_timesteps)),
             jaxls.SE3Var(jnp.arange(0, num_timesteps-1)),
@@ -1725,7 +1725,7 @@ def main(
     ground_prior_cost_weight: float = 5.0,
     hip_yaw_cost_weight: float = 5.0,
     hip_pitch_cost_weight: float = 0.0,
-    hip_roll_cost_weight: float = 0.0,
+    hip_roll_cost_weight: float = 2.0, # hsc: 下蹲的时候，我观察到它会增大roll而不是pitch
 ) -> None:
     """
     Process robot retargeting from human motion capture data.

@@ -163,3 +163,7 @@ python convert_to_asap_format.py \
     --input_path "./demo_data/output_calib_mesh/megahunter_megasam_reconstruction_results_${VIDEO_NAME}_cam01_frame_${START_FRAME}_${END_FRAME}_subsample_${SUBSAMPLE_FACTOR}/retarget_poses_g1.h5" \
     --output_path "./demo_data/output_calib_mesh/megahunter_megasam_reconstruction_results_${VIDEO_NAME}_cam01_frame_${START_FRAME}_${END_FRAME}_subsample_${SUBSAMPLE_FACTOR}/${VIDEO_NAME}.pkl" \
     --name "${VIDEO_NAME}"
+
+
+python visualization/kinematics_only_mujoco.py \
+	--postprocessed-dir "./demo_data/output_calib_mesh/megahunter_megasam_reconstruction_results_${VIDEO_NAME}_cam01_frame_${START_FRAME}_${END_FRAME}_subsample_${SUBSAMPLE_FACTOR}" \

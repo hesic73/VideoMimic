@@ -184,7 +184,7 @@ def main(
         )
 
     model = spec.compile()
-    debug_inspect_mjcf_model(model)
+    # debug_inspect_mjcf_model(model)
     data = mujoco.MjData(model)
     mj_qpos_indices, _, _ = get_ordered_joint_indices(model, joint_names)
     model.opt.gravity[:] = 0
