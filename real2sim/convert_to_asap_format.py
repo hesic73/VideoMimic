@@ -5,6 +5,9 @@ from pathlib import Path
 import joblib
 from scipy.spatial.transform import Rotation
 from loguru import logger
+import mujoco
+import os.path as osp
+from typing import List, Tuple
 
 ASAP_JOINT_ORDER = [
     "left_hip_pitch_joint",
@@ -97,6 +100,116 @@ def load_dict_from_hdf5(h5file, path="/"):
     return result
 
 
+def get_ordered_joint_indices(
+    model: mujoco.MjModel, policy_joint_order: List[str]
+) -> Tuple[List[int], List[int], List[int]]:
+    """
+    Finds and returns the indices for qpos, qvel, and actuators in the MuJoCo
+    model that correspond to the given list of joint names.
+    """
+    mj_qpos_indices: List[int] = []
+    mj_qvel_indices: List[int] = []
+    mj_actuator_indices: List[int] = []
+
+    for joint_name in policy_joint_order:
+        try:
+            joint_id = model.joint(joint_name).id
+        except KeyError:
+            available_joints = [mujoco.mj_id2name(
+                model, mujoco.mjtObj.mjOBJ_JOINT, i) for i in range(model.njnt)]
+            raise ValueError(
+                f"Configuration Error: Joint '{joint_name}' "
+                f"not found in the MuJoCo model. Available joints: {available_joints}"
+            )
+
+        mj_qpos_indices.append(model.jnt_qposadr[joint_id])
+        mj_qvel_indices.append(model.jnt_dofadr[joint_id])
+
+        actuator_found_for_joint = False
+        for act_id in range(model.nu):
+            if (
+                model.actuator_trntype[act_id] == mujoco.mjtTrn.mjTRN_JOINT
+                and model.actuator_trnid[act_id, 0] == joint_id
+            ):
+                mj_actuator_indices.append(act_id)
+                actuator_found_for_joint = True
+                break
+
+        if not actuator_found_for_joint:
+            raise ValueError(
+                f"Configuration Error: No actuator found for joint '{joint_name}'."
+            )
+
+    return mj_qpos_indices, mj_qvel_indices, mj_actuator_indices
+
+
+def compute_feet_positions_with_mujoco(
+    joints: np.ndarray,
+    root_pos: np.ndarray, 
+    root_quat: np.ndarray,
+    joint_names: List[str]
+) -> np.ndarray:
+    """
+    Use MuJoCo forward kinematics to compute feet positions
+    
+    Args:
+        joints: Joint angles (N, J)
+        root_pos: Root positions (N, 3)
+        root_quat: Root quaternions (N, 4) in xyzw convention
+        joint_names: List of joint names
+    
+    Returns:
+        feet_positions: Computed feet positions using MuJoCo FK (N, 2, 3)
+    """
+    # Load MuJoCo model
+    xml_path = osp.join(osp.dirname(__file__), "assets/robot_asset/g1/g1_29dof_anneal_23dof_disable_collision.xml")
+    if not osp.exists(xml_path):
+        logger.warning(f"MuJoCo XML not found at {xml_path}, skipping MuJoCo verification")
+        return None
+        
+    model = mujoco.MjModel.from_xml_path(xml_path)
+    data = mujoco.MjData(model)
+    
+    # Get joint indices
+    mj_qpos_indices, _, _ = get_ordered_joint_indices(model, joint_names)
+    
+    feet_link_names = ["left_ankle_roll_link", "right_ankle_roll_link"]
+    feet_positions = []
+    
+    N = joints.shape[0]
+    logger.info(f"Computing MuJoCo FK for {N} frames...")
+    
+    for t in range(N):
+        # Set root pose (position + quaternion in wxyz format for MuJoCo)
+        data.qpos[0:3] = root_pos[t]
+        data.qpos[3:7] = np.concatenate([root_quat[t][3:4], root_quat[t][:3]])  # xyzw -> wxyz
+        
+        # Set joint angles  
+        for i, angle in enumerate(joints[t]):
+            data.qpos[mj_qpos_indices[i]] = angle
+            
+        # Forward kinematics
+        mujoco.mj_forward(model, data)
+        
+        # Get feet positions
+        frame_feet_pos = []
+        for foot_name in feet_link_names:
+            try:
+                body_id = model.body(foot_name).id
+                foot_pos = data.xpos[body_id].copy()
+                frame_feet_pos.append(foot_pos)
+            except:
+                logger.warning(f"Body {foot_name} not found in MuJoCo model")
+                frame_feet_pos.append(np.array([0, 0, 0]))
+        
+        feet_positions.append(frame_feet_pos)
+    
+    feet_positions = np.array(feet_positions)  # (N, 2, 3)
+    logger.info(f"Successfully computed feet positions for {N} frames")
+    
+    return feet_positions
+
+
 def main(
     input_path: Path,
     output_path: Path,
@@ -107,34 +220,34 @@ def main(
         root_pos = f["root_pos"][:]  # (N, 3)
         root_quat = f["root_quat"][:]  # (N, 4) in xyzw convention
 
-        link_pos = f["link_pos"][:]
-        link_quat = f["link_quat"][:]
-        link_names = f.attrs["link_names"].tolist()
-
-
         joint_names = f.attrs["joint_names"]
         fps = f.attrs["fps"]
 
-
-    feet_link_names = ["left_ankle_pitch_link", "right_ankle_pitch_link"]
-    feet_link_indices = [link_names.index(name) for name in feet_link_names]
-    feet_link_pos = link_pos[:, feet_link_indices,:]
-    feet_link_z = feet_link_pos[..., 2] # (N, 2)
-    print(f"Feet link z positions: {feet_link_z}")
+    # === Compute Feet Positions with MuJoCo Forward Kinematics ===
+    logger.info("Computing feet positions using MuJoCo forward kinematics...")
+    feet_positions = compute_feet_positions_with_mujoco(
+        joints, root_pos, root_quat, joint_names
+    )
+    
+    if feet_positions is not None:
+        feet_link_z = feet_positions[:, :, 2]  # (N, 2) - z coordinates only
+        print(f"MuJoCo computed feet z positions: {feet_link_z}")
+    else:
+        logger.error("Failed to compute feet positions with MuJoCo FK!")
+        raise RuntimeError("Cannot proceed without feet position data")
 
     # --- 1. Infer initial position from feet height trajectory ---
     # We want to apply a transformation to root so that feet at their lowest point are at z=0.035
     
     # Find the minimum average feet height (lowest point)
     min_feet_height = np.min(feet_link_z)
+    # NOTE (hsc): 它估计的不准，还是第几帧的平均值吧。先验在于，前面几帧和最后几帧应该是着地的
+    min_feet_height = (feet_link_z[0:5].mean()+feet_link_z[-5:].mean())/2
     
     # Calculate the offset needed: we want min_feet_height to become 0.035
     # So the offset is: 0.035 - min_feet_height
-    # feet_offset = 0.035 - min_feet_height
+    feet_offset = 0.035 - min_feet_height
 
-    # NOTE (hsc): 它估计的不准，还是第几帧的平均值吧。先验在于，前面几帧和最后几帧应该是着地的
-    feet_offset = 0.035 - (feet_link_z[0:5].mean()+feet_link_z[-5:].mean())/2
-    
     # Set initial position: xy at (0,0), z based on root position plus offset
     initial_pos_np = np.array([0.0, 0.0, root_pos[0, 2] + feet_offset])
     
