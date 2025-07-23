@@ -231,7 +231,7 @@ def main(
     
     if feet_positions is not None:
         feet_link_z = feet_positions[:, :, 2]  # (N, 2) - z coordinates only
-        print(f"MuJoCo computed feet z positions: {feet_link_z}")
+        # print(f"MuJoCo computed feet z positions: {feet_link_z}")
     else:
         logger.error("Failed to compute feet positions with MuJoCo FK!")
         raise RuntimeError("Cannot proceed without feet position data")
@@ -241,8 +241,8 @@ def main(
     
     # Find the minimum average feet height (lowest point)
     min_feet_height = np.min(feet_link_z)
-    # NOTE (hsc): 它估计的不准，还是第几帧的平均值吧。先验在于，前面几帧和最后几帧应该是着地的
-    min_feet_height = (feet_link_z[0:5].mean()+feet_link_z[-5:].mean())/2
+    # # NOTE (hsc): 它估计的不准，还是第几帧的平均值吧。先验在于，前面几帧和最后几帧应该是着地的
+    # min_feet_height = (feet_link_z[0:5].mean()+feet_link_z[-5:].mean())/2
     
     # Calculate the offset needed: we want min_feet_height to become 0.035
     # So the offset is: 0.035 - min_feet_height

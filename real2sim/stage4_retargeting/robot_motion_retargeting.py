@@ -1220,6 +1220,10 @@ def process_retargeting(
 
             print(f"Raycasting complete. Final Misses: {len(final_missed_indices)}")
 
+            # NOTE (hsc): 这里我引入bias：我知道地面应该是平的
+            target_ground_z_mean = target_ground_z.mean()
+            target_ground_z=onp.array([[target_ground_z_mean, target_ground_z_mean]]).repeat(num_timesteps, axis=0)
+
         else:
             # If no mesh or weight is zero, fill with zeros (or fallback Z)
             fallback_z = onp.min(onp.array(target_keypoints)[..., 2]) if target_keypoints.size > 0 else 0.0
@@ -1271,7 +1275,7 @@ def process_retargeting(
             ))
             end_time = time.time()
             print(f"Optimization finished in {end_time - start_time:.2f} seconds.")
-            print(summary)
+            # print(summary)
 
 
             optimized_scale, optimized_robot_cfg, optimized_T_world_root = _optimized_scale, _optimized_robot_cfg, _optimized_T_world_root
@@ -1721,8 +1725,8 @@ def main(
     limit_cost_factor_weight: float = 1000.0,
     smoothness_cost_factor_weight: float = 10.0,
     foot_skating_cost_weight: float = 10.0,
-    ground_contact_cost_weight: float = 1.0,
-    ground_prior_cost_weight: float = 5.0,
+    ground_contact_cost_weight: float = 100.0,
+    ground_prior_cost_weight: float = 100.0,
     hip_yaw_cost_weight: float = 5.0,
     hip_pitch_cost_weight: float = 0.0,
     hip_roll_cost_weight: float = 2.0, # hsc: 下蹲的时候，我观察到它会增大roll而不是pitch
