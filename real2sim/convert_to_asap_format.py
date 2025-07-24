@@ -223,6 +223,10 @@ def main(
         joint_names = f.attrs["joint_names"]
         fps = f.attrs["fps"]
 
+        contacts = f["contacts"]
+        left_foot_contact = contacts["left_foot"][:]
+        right_foot_contact = contacts["right_foot"][:]
+
     # === Compute Feet Positions with MuJoCo Forward Kinematics ===
     logger.info("Computing feet positions using MuJoCo forward kinematics...")
     feet_positions = compute_feet_positions_with_mujoco(
@@ -304,6 +308,7 @@ def main(
         "root_trans_offset": root_trans_offset.tolist(),
         "pose_aa": pose_aa.tolist(),
         "fps": float(fps),
+        "foot_contacts":np.stack([left_foot_contact, right_foot_contact], axis=1).tolist(),
     }
 
     final_data = {name: asap_format_data}
